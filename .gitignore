@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+data/
+*.pdf
+*.zip
+tokenizers/
+trained_tokenizers/
+models/
+.venv/
+.git-upload/
+.agents/
