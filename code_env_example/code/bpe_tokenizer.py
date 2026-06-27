@@ -70,6 +70,16 @@ class BPETokenizer(BaseTokenizer):
         self.direct_bigram_tokens: List[str] = []
         self.direct_bigram_by_first: Dict[str, List[str]] = {}
 
+        # WHAT: Cache of merge results for one word (optionally with one
+        # leading space marker), keyed by that substring, holding spans
+        # relative to the group's own start.
+        # WHY: encode() speed. See _merge_group for the correctness argument:
+        # every learned merge pair comes from a training sequence that is
+        # exactly one word or one (leading space + word), so the merge loop
+        # never needs to look past a single such group. Caching it means a
+        # frequent word like "the" or "@user" is only ever merged once.
+        self._group_cache: Dict[str, List[Tuple[str, int, int]]] = {}
+
     def __setstate__(self, state: Dict) -> None:
         """Restore old pickles safely after code improvements.
 
@@ -90,6 +100,8 @@ class BPETokenizer(BaseTokenizer):
         if not hasattr(self, "direct_bigram_tokens"):
             forced = self.forced_bigram_token
             self.direct_bigram_tokens = [forced] if forced else []
+        if not hasattr(self, "_group_cache"):
+            self._group_cache = {}
         self._rebuild_direct_bigram_index()
 
     def train(self, texts: List[str]) -> None:
@@ -325,52 +337,130 @@ class BPETokenizer(BaseTokenizer):
         return [token for token, _, _ in self._bpe_token_spans(text)]
 
     def _bpe_token_spans(self, text: str) -> List[Tuple[str, int, int]]:
-        """Apply BPE while carrying original character offsets."""
-        token_spans = self._initial_token_spans(text)
+        """Apply BPE while carrying original character offsets.
 
-        while len(token_spans) > 1:
+        WHAT: Split the character-level spans into small, independent
+        groups and merge each group on its own (with caching), instead of
+        repeatedly re-scanning the whole text for the single best merge.
+        WHY (correctness): a learned merge pair always comes from a
+        training sequence in train() that is exactly one word's characters,
+        or one leading space marker plus one word's characters (see
+        _collect_training_counts / _add_initial_character_vocabulary).
+        _is_safe_merge_token also guarantees a merged token never contains
+        more than one space marker, and never contains one anywhere but the
+        start. Together this means a pair (left, right) can only be in
+        merge_ranks if left and right both belong to the same word, or right
+        is the first piece of a word and left is exactly the single space
+        marker immediately before it. So the original whole-text merge loop
+        could never actually merge across a group boundary as defined below
+        -- splitting into groups changes nothing about the result, it only
+        bounds how much text one merge loop has to re-scan, and lets
+        repeated words reuse a cached result instead of recomputing it.
+        WHY (speed): this is the dominant cost for encode() on longer or
+        noisier text, since the original loop's cost grows with the square
+        of the number of remaining spans in the *whole* line. Each group
+        here is just one word long, and common words are cached.
+        """
+        initial_spans = self._initial_token_spans(text)
+        output: List[Tuple[str, int, int]] = []
+        index = 0
+        total = len(initial_spans)
+
+        while index < total:
+            token, start, end = initial_spans[index]
+
+            if end - start > 1:
+                # WHAT: An already-finished multi-character span, i.e. a
+                # direct bigram token from _initial_token_spans.
+                # WHY: Direct bigram tokens never appear as either side of a
+                # learned merge pair, so they are emitted as-is.
+                output.append((token, start, end))
+                index += 1
+                continue
+
+            group_start = index
+            if token == self.space_token:
+                # WHAT: A lone space marker can only ever fuse with the word
+                # run immediately after it (never with another space, and
+                # never with an already-finished multi-character span).
+                next_is_mergeable_word = (
+                    index + 1 < total
+                    and initial_spans[index + 1][2] - initial_spans[index + 1][1] == 1
+                    and initial_spans[index + 1][0] != self.space_token
+                )
+                if not next_is_mergeable_word:
+                    output.append((token, start, end))
+                    index += 1
+                    continue
+                index += 1  # fold the space into the group that follows
+
+            # WHAT: Consume the run of plain single-character, non-space
+            # spans that makes up the rest of this group (one word).
+            while (
+                index < total
+                and initial_spans[index][2] - initial_spans[index][1] == 1
+                and initial_spans[index][0] != self.space_token
+            ):
+                index += 1
+
+            output.extend(self._merge_group(initial_spans[group_start:index]))
+
+        return output
+
+    def _merge_group(
+        self, group: List[Tuple[str, int, int]]
+    ) -> List[Tuple[str, int, int]]:
+        """Apply learned merges to one self-contained group (see above).
+
+        WHAT: `group` is a list of single-character spans -- one word,
+        optionally with a single leading space marker -- that can only ever
+        merge among themselves. The merge loop itself is unchanged from the
+        original whole-text version, just scoped to this short group.
+        WHY: Caches by the group's character string, since the same word or
+        leading-space word recurs constantly across real text.
+        """
+        key = "".join(piece for piece, _, _ in group)
+        base = group[0][1]
+        cached = self._group_cache.get(key)
+        if cached is not None:
+            return [(piece, base + s, base + e) for piece, s, e in cached]
+
+        spans = [(piece, s - base, e - base) for piece, s, e in group]
+
+        while len(spans) > 1:
             best_index = -1
             best_rank = None
 
-            # WHAT: Find the applicable merge with the earliest training rank.
-            # WHY: This is the standard deterministic BPE encoding rule.
-            for index in range(len(token_spans) - 1):
-                pair = (token_spans[index][0], token_spans[index + 1][0])
+            for idx in range(len(spans) - 1):
+                pair = (spans[idx][0], spans[idx + 1][0])
                 rank = self.merge_ranks.get(pair)
                 if rank is not None and (best_rank is None or rank < best_rank):
                     best_rank = rank
-                    best_index = index
+                    best_index = idx
 
             if best_index == -1:
                 break
 
-            # WHAT: Merge every non-overlapping occurrence of the selected
-            # pair, not only the first one.
-            # WHY: This matches the training-time BPE rewrite rule and avoids
-            # extra passes on texts with repeated patterns like "ha ha ha".
-            selected_pair = (
-                token_spans[best_index][0],
-                token_spans[best_index + 1][0],
-            )
+            selected_pair = (spans[best_index][0], spans[best_index + 1][0])
             merged_spans = []
-            index = 0
-            while index < len(token_spans):
+            idx = 0
+            while idx < len(spans):
                 if (
-                    index + 1 < len(token_spans)
-                    and token_spans[index][0] == selected_pair[0]
-                    and token_spans[index + 1][0] == selected_pair[1]
+                    idx + 1 < len(spans)
+                    and spans[idx][0] == selected_pair[0]
+                    and spans[idx + 1][0] == selected_pair[1]
                 ):
-                    left_token, start, _ = token_spans[index]
-                    right_token, _, end = token_spans[index + 1]
-                    merged_spans.append((left_token + right_token, start, end))
-                    index += 2
+                    left_token, s, _ = spans[idx]
+                    right_token, _, e = spans[idx + 1]
+                    merged_spans.append((left_token + right_token, s, e))
+                    idx += 2
                 else:
-                    merged_spans.append(token_spans[index])
-                    index += 1
+                    merged_spans.append(spans[idx])
+                    idx += 1
+            spans = merged_spans
 
-            token_spans = merged_spans
-
-        return token_spans
+        self._group_cache[key] = spans
+        return [(piece, base + s, base + e) for piece, s, e in spans]
 
     def _initial_token_spans(self, text: str) -> List[Tuple[str, int, int]]:
         """Create character spans, with an optional direct bigram fallback.
