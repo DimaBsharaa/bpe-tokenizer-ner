@@ -68,6 +68,7 @@ class BPETokenizer(BaseTokenizer):
         self.best_word_bigram: Optional[str] = None
         self.forced_bigram_token: Optional[str] = None
         self.direct_bigram_tokens: List[str] = []
+        self.direct_bigram_by_first: Dict[str, List[str]] = {}
 
     def __setstate__(self, state: Dict) -> None:
         """Restore old pickles safely after code improvements.
@@ -89,6 +90,7 @@ class BPETokenizer(BaseTokenizer):
         if not hasattr(self, "direct_bigram_tokens"):
             forced = self.forced_bigram_token
             self.direct_bigram_tokens = [forced] if forced else []
+        self._rebuild_direct_bigram_index()
 
     def train(self, texts: List[str]) -> None:
         """Train the BPE tokenizer on a list of texts."""
@@ -512,13 +514,18 @@ class BPETokenizer(BaseTokenizer):
         # Longest-first matching makes encoding deterministic if one bigram is
         # ever a prefix of another.
         self.direct_bigram_tokens.sort(key=len, reverse=True)
+        self._rebuild_direct_bigram_index()
 
     def _match_direct_bigram(self, normalized: str, index: int) -> Optional[str]:
         """Return the direct bigram token starting at index, if one exists."""
         if index > 0 and normalized[index - 1] != self.space_token:
             return None
 
-        for token in self.direct_bigram_tokens:
+        # WHAT: Only inspect direct bigrams that can start with this character.
+        # WHY: Encoding visits many character positions. A dict index avoids
+        # scanning every selected bigram at positions where most cannot match,
+        # while preserving the same longest-first order inside each bucket.
+        for token in self.direct_bigram_by_first.get(normalized[index], []):
             end = index + len(token)
             if (
                 normalized.startswith(token, index)
@@ -526,6 +533,17 @@ class BPETokenizer(BaseTokenizer):
             ):
                 return token
         return None
+
+    def _rebuild_direct_bigram_index(self) -> None:
+        """Build the first-character lookup table for direct bigram matching."""
+        self.direct_bigram_by_first = {}
+        for token in self.direct_bigram_tokens:
+            if not token:
+                continue
+            self.direct_bigram_by_first.setdefault(token[0], []).append(token)
+
+        for candidates in self.direct_bigram_by_first.values():
+            candidates.sort(key=len, reverse=True)
 
     def _is_safe_merge_token(self, token: str) -> bool:
         """Return whether a learned BPE token respects word boundaries."""
@@ -572,4 +590,5 @@ class BPETokenizer(BaseTokenizer):
             self._add_token(self.best_word_bigram)
             self.direct_bigram_tokens.append(self.best_word_bigram)
             self.direct_bigram_tokens.sort(key=len, reverse=True)
+            self._rebuild_direct_bigram_index()
             self.forced_bigram_token = self.best_word_bigram
