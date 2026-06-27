@@ -47,6 +47,7 @@ class BPETokenizer(BaseTokenizer):
         # frequency algorithm, so keeping frequent words preserves the useful
         # signal and keeps training tractable.
         self.max_word_entries = 50000
+        self.max_leading_space_entries = 30000
         self.max_token_chars = 40
         self.min_pair_frequency = 2
 
@@ -58,6 +59,7 @@ class BPETokenizer(BaseTokenizer):
         # cross-word fragments dominate the vocabulary.
         self.max_direct_bigrams = 32
         self.min_direct_bigram_frequency = 10
+        self.direct_bigram_min_score = 8.0
 
         # WHAT: Remember the most common adjacent-word surface seen in training.
         # WHY: The assignment has a hard requirement that each tokenizer contain
@@ -104,6 +106,17 @@ class BPETokenizer(BaseTokenizer):
             normalized = self._normalize_surface(surface)
             if normalized:
                 training_sequences[tuple(normalized)] = count
+
+        # WHAT: Also learn tokens for words preceded by a space marker, e.g.
+        # "\u2581the" or "\u2581London".
+        # WHY: The previous experiment kept BPE purely word-internal and became
+        # inefficient because every word boundary stayed as its own token. A
+        # leading-space word piece is safe: it does not span two words, but it
+        # recovers the compression pattern used by common subword tokenizers.
+        for surface, count in word_counts.most_common(self.max_leading_space_entries):
+            normalized = self._normalize_surface(surface)
+            if normalized:
+                training_sequences[(self.space_token, *tuple(normalized))] = count
 
         self._add_initial_character_vocabulary(training_sequences)
         self._add_direct_bigram_tokens(direct_bigrams)
@@ -153,6 +166,42 @@ class BPETokenizer(BaseTokenizer):
                 continue
             pieces.append(token)
         return "".join(pieces).replace(self.space_token, " ")
+
+    def sanity_check(self, sample_text: str = "New York is here") -> Dict:
+        """Return simple invariants that should hold after training.
+
+        WHAT: This is a lightweight debugging helper, not part of the provided
+        course interface.
+        WHY: The HW has several hard tokenizer requirements. Keeping the checks
+        close to the tokenizer makes it easy to verify a trained pickle before
+        spending GPU time on NER.
+        """
+        bigrams = [
+            token
+            for token in self.token_to_id
+            if token not in self.special_tokens
+            and self.space_token in token.strip(self.space_token)
+        ]
+        emitted_bigram = False
+        for token in bigrams:
+            surface = token.replace(self.space_token, " ")
+            encoded_tokens = [self.id_to_token.get(i) for i in self.encode(surface)]
+            if token in encoded_tokens:
+                emitted_bigram = True
+                break
+
+        return {
+            "has_space_token": bool(getattr(self, "space_token", None)),
+            "has_token_space": bool(getattr(self, "token_space", None)),
+            "num_bigrams": len(bigrams),
+            "no_three_word_tokens": all(
+                token.count(self.space_token) <= 1
+                for token in self.token_to_id
+                if token not in self.special_tokens
+            ),
+            "emits_bigram": emitted_bigram,
+            "reconstructs_sample": self.decode(self.encode(sample_text)) == sample_text,
+        }
 
     def encode_with_offsets(self, text: str) -> Tuple[List[int], List[Tuple[int, int]]]:
         """Encode text and return character spans for each token.
@@ -221,12 +270,13 @@ class BPETokenizer(BaseTokenizer):
             for left, right in zip(sequence, sequence[1:]):
                 merged = left + right
 
-                # WHAT: The BPE merge table is learned inside words.
-                # WHY: Whole adjacent-word tokens are added separately from
-                # corpus bigram counts. This prevents intermediate cross-word
-                # fragments such as "I\u2581w", which were legal but noisy for
-                # NER alignment.
-                if self.space_token in merged:
+                # WHAT: Allow normal word-internal merges plus leading-space
+                # word pieces like "\u2581the"; block internal cross-word
+                # fragments like "I\u2581w".
+                # WHY: Leading-space pieces improve token efficiency without
+                # labeling ambiguity, while internal cross-word fragments blur
+                # the first-subtoken labels used by the NER pipeline.
+                if not self._is_safe_merge_token(merged):
                     continue
                 if len(merged) > self.max_token_chars:
                     continue
@@ -350,17 +400,35 @@ class BPETokenizer(BaseTokenizer):
         return token_spans
 
     def _select_direct_bigrams(self, word_bigram_counts: Counter) -> List[str]:
-        """Choose clean whole-word bigram tokens from provided training data."""
-        selected = []
-        for surface, count in word_bigram_counts.most_common():
-            if count < self.min_direct_bigram_frequency:
-                break
-            if self._is_direct_bigram_candidate(surface):
-                selected.append(surface)
-            if len(selected) >= self.max_direct_bigrams:
-                break
+        """Choose whole-word bigram tokens that are useful for NER.
 
-        if not selected and self.best_word_bigram:
+        WHAT: Rank candidate bigrams by a small NER-oriented score instead of
+        raw frequency alone.
+        WHY: Raw frequency tends to pick boring phrases such as "of\u2581the" or
+        noisy social phrases such as "lol\u2581I". For NER we would rather spend
+        the required bigram budget on stable proper-name-looking pairs such as
+        "New\u2581York" or "European\u2581Commission".
+        """
+        scored = []
+        fallback_scored = []
+        for surface, count in word_bigram_counts.items():
+            if count < self.min_direct_bigram_frequency:
+                continue
+            if not self._is_direct_bigram_candidate(surface):
+                continue
+
+            score = self._score_direct_bigram(surface, count)
+            fallback_scored.append((score, count, surface))
+            if score >= self.direct_bigram_min_score:
+                scored.append((score, count, surface))
+
+        scored.sort(reverse=True)
+        selected = [surface for _, _, surface in scored[: self.max_direct_bigrams]]
+
+        if not selected and fallback_scored:
+            fallback_scored.sort(reverse=True)
+            selected.append(fallback_scored[0][2])
+        elif not selected and self.best_word_bigram:
             selected.append(self.best_word_bigram)
         return selected
 
@@ -381,6 +449,56 @@ class BPETokenizer(BaseTokenizer):
                 return False
 
         return True
+
+    def _score_direct_bigram(self, surface: str, count: int) -> float:
+        """Score adjacent-word tokens for NER usefulness."""
+        left, right = surface.split(self.space_token)
+        left_lower = left.lower()
+        right_lower = right.lower()
+        score = min(count, 100) ** 0.5
+
+        # WHAT: Prefer proper-name-looking pairs.
+        # WHY: In NER, multi-word entities are often capitalized names,
+        # organizations, locations, or titles.
+        if left[:1].isupper() and right[:1].isupper():
+            score += 12.0
+        elif left[:1].isupper() or right[:1].isupper():
+            score += 4.0
+
+        if left.isupper() and len(left) > 1:
+            score += 3.0
+        if right.isupper() and len(right) > 1:
+            score += 3.0
+
+        # WHAT: Penalize high-frequency function-word phrases.
+        # WHY: They help compression, but they are rarely entity signals and can
+        # consume the assignment's small direct-bigram budget.
+        function_words = {
+            "a", "an", "and", "are", "as", "at", "be", "been", "but",
+            "by", "for", "from", "has", "have", "he", "her", "his",
+            "i", "in", "is", "it", "its", "me", "my", "of", "on",
+            "or", "our", "she", "that", "the", "their", "this", "to",
+            "was", "we", "were", "with", "you", "your",
+        }
+        if left_lower in function_words:
+            score -= 6.0
+        if right_lower in function_words:
+            score -= 6.0
+
+        boring_pairs = {
+            ("of", "the"), ("in", "the"), ("to", "the"), ("on", "the"),
+            ("for", "the"), ("and", "the"), ("at", "the"), ("is", "a"),
+            ("it", "is"), ("i", "am"), ("you", "are"), ("do", "not"),
+            ("dont", "know"), ("don't", "know"),
+        }
+        if (left_lower, right_lower) in boring_pairs:
+            score -= 10.0
+
+        social_starts = {"lol", "haha", "hahaha", "omg", "yeah", "yes", "no"}
+        if left_lower in social_starts or right_lower in social_starts:
+            score -= 8.0
+
+        return score
 
     def _add_direct_bigram_tokens(self, bigrams: List[str]) -> None:
         """Add selected adjacent-word tokens before filling the BPE budget."""
@@ -408,6 +526,15 @@ class BPETokenizer(BaseTokenizer):
             ):
                 return token
         return None
+
+    def _is_safe_merge_token(self, token: str) -> bool:
+        """Return whether a learned BPE token respects word boundaries."""
+        space_count = token.count(self.space_token)
+        if space_count == 0:
+            return True
+        if space_count > 1:
+            return False
+        return token.startswith(self.space_token)
 
     def _add_token(self, token: str) -> None:
         """Add one token to the vocabulary if it is not present yet."""
