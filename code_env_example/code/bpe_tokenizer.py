@@ -106,6 +106,15 @@ class BPETokenizer(BaseTokenizer):
 
     def train(self, texts: List[str]) -> None:
         """Train the BPE tokenizer on a list of texts."""
+        # WHAT: Drop any cached encode() results from a previous training run.
+        # WHY: _merge_group's cache is keyed only by surface text, not by which
+        # merge_ranks produced it. If train() were ever called again on the
+        # same instance, stale entries from the old merge table would be
+        # returned for words seen during this new merge_ranks. Course scripts
+        # always train a fresh instance once, so this should not normally
+        # trigger, but it keeps train() safe to call more than once.
+        self._group_cache = {}
+
         word_counts, word_bigram_counts = self._collect_training_counts(texts)
         self.best_word_bigram = self._best_bigram_surface(word_bigram_counts)
         direct_bigrams = self._select_direct_bigrams(word_bigram_counts)
