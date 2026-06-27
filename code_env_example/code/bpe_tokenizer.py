@@ -44,19 +44,28 @@ class BPETokenizer(BaseTokenizer):
         # WHAT: Practical limits for the training vocabulary used to learn BPE.
         # WHY: Domain 1 is very large and noisy. Learning from every unique
         # handle/URL/typo would spend most time on one-off strings. BPE is a
-        # frequency algorithm, so keeping frequent words and frequent adjacent
-        # word pairs preserves the useful signal and keeps training tractable.
-        self.max_word_entries = 60000
-        self.max_bigram_entries = 60000
+        # frequency algorithm, so keeping frequent words preserves the useful
+        # signal and keeps training tractable.
+        self.max_word_entries = 50000
         self.max_token_chars = 40
         self.min_pair_frequency = 2
 
+        # WHAT: Add only a small, clean set of whole adjacent-word tokens.
+        # WHY: The HW requires at least one bigram token, but the NER model uses
+        # first-subtoken word labels. Too many fragmentary cross-word BPE merges
+        # can blur word boundaries, especially in noisy Twitter text. Keeping
+        # bigrams whole and rare makes the requirement explicit without letting
+        # cross-word fragments dominate the vocabulary.
+        self.max_direct_bigrams = 32
+        self.min_direct_bigram_frequency = 10
+
         # WHAT: Remember the most common adjacent-word surface seen in training.
         # WHY: The assignment has a hard requirement that each tokenizer contain
-        # at least one token spanning two adjacent words. Normal BPE should learn
-        # such tokens from the bigram entries; this is a final safety check.
+        # at least one token spanning two adjacent words. Direct bigram selection
+        # should handle this normally; this field supports a final safety check.
         self.best_word_bigram: Optional[str] = None
         self.forced_bigram_token: Optional[str] = None
+        self.direct_bigram_tokens: List[str] = []
 
     def __setstate__(self, state: Dict) -> None:
         """Restore old pickles safely after code improvements.
@@ -75,29 +84,29 @@ class BPETokenizer(BaseTokenizer):
             self.token_space = self.space_token
         if not hasattr(self, "forced_bigram_token"):
             self.forced_bigram_token = None
+        if not hasattr(self, "direct_bigram_tokens"):
+            forced = self.forced_bigram_token
+            self.direct_bigram_tokens = [forced] if forced else []
 
     def train(self, texts: List[str]) -> None:
         """Train the BPE tokenizer on a list of texts."""
         word_counts, word_bigram_counts = self._collect_training_counts(texts)
         self.best_word_bigram = self._best_bigram_surface(word_bigram_counts)
+        direct_bigrams = self._select_direct_bigrams(word_bigram_counts)
 
         # WHAT: Build the BPE training set as weighted character sequences.
         # WHY: This is the classic efficient BPE trick: train on a vocabulary of
         # unique strings with frequencies instead of rewriting the whole corpus
-        # every iteration. We include adjacent-word strings so merges may cross
-        # exactly one space, satisfying the HW bigram-token requirement.
+        # every iteration. We train the merge table on words only so subword
+        # pieces stay aligned with words for the NER first-subtoken labels.
         training_sequences: Dict[Tuple[str, ...], int] = {}
         for surface, count in word_counts.most_common(self.max_word_entries):
             normalized = self._normalize_surface(surface)
             if normalized:
                 training_sequences[tuple(normalized)] = count
 
-        for surface, count in word_bigram_counts.most_common(self.max_bigram_entries):
-            normalized = self._normalize_surface(surface)
-            if normalized:
-                training_sequences[tuple(normalized)] = count
-
         self._add_initial_character_vocabulary(training_sequences)
+        self._add_direct_bigram_tokens(direct_bigrams)
 
         # WHAT: Repeatedly merge the most frequent adjacent token pair.
         # WHY: This is the BPE algorithm from the lecture/HW: start at
@@ -212,11 +221,12 @@ class BPETokenizer(BaseTokenizer):
             for left, right in zip(sequence, sequence[1:]):
                 merged = left + right
 
-                # WHAT: Keep tokens at most at the adjacent-word bigram level.
-                # WHY: The HW says tokens may reach two adjacent words; allowing
-                # multiple spaces would create longer phrase tokens and make NER
-                # word alignment less predictable.
-                if merged.count(self.space_token) > 1:
+                # WHAT: The BPE merge table is learned inside words.
+                # WHY: Whole adjacent-word tokens are added separately from
+                # corpus bigram counts. This prevents intermediate cross-word
+                # fragments such as "I\u2581w", which were legal but noisy for
+                # NER alignment.
+                if self.space_token in merged:
                     continue
                 if len(merged) > self.max_token_chars:
                     continue
@@ -321,14 +331,16 @@ class BPETokenizer(BaseTokenizer):
         able to produce at least one adjacent-word token.
         """
         normalized = self._normalize_surface(text)
-        forced = self.forced_bigram_token
         token_spans = []
         index = 0
 
         while index < len(text):
-            if forced and normalized.startswith(forced, index):
-                token_spans.append((forced, index, index + len(forced)))
-                index += len(forced)
+            matched_bigram = self._match_direct_bigram(normalized, index)
+            if matched_bigram:
+                token_spans.append(
+                    (matched_bigram, index, index + len(matched_bigram))
+                )
+                index += len(matched_bigram)
                 continue
 
             token = self.space_token if text[index].isspace() else text[index]
@@ -336,6 +348,66 @@ class BPETokenizer(BaseTokenizer):
             index += 1
 
         return token_spans
+
+    def _select_direct_bigrams(self, word_bigram_counts: Counter) -> List[str]:
+        """Choose clean whole-word bigram tokens from provided training data."""
+        selected = []
+        for surface, count in word_bigram_counts.most_common():
+            if count < self.min_direct_bigram_frequency:
+                break
+            if self._is_direct_bigram_candidate(surface):
+                selected.append(surface)
+            if len(selected) >= self.max_direct_bigrams:
+                break
+
+        if not selected and self.best_word_bigram:
+            selected.append(self.best_word_bigram)
+        return selected
+
+    def _is_direct_bigram_candidate(self, surface: str) -> bool:
+        """Filter noisy adjacent-word pairs before adding whole bigram tokens."""
+        parts = surface.split(self.space_token)
+        if len(parts) != 2:
+            return False
+
+        for word in parts:
+            if len(word) < 2:
+                return False
+            if word.startswith(("http", "@", "#")):
+                return False
+            if not any(char.isalpha() for char in word):
+                return False
+            if not all(char.isalnum() or char in "'-" for char in word):
+                return False
+
+        return True
+
+    def _add_direct_bigram_tokens(self, bigrams: List[str]) -> None:
+        """Add selected adjacent-word tokens before filling the BPE budget."""
+        self.direct_bigram_tokens = []
+        for token in bigrams:
+            if len(self.token_to_id) >= self.vocab_size:
+                break
+            self._add_token(token)
+            self.direct_bigram_tokens.append(token)
+
+        # Longest-first matching makes encoding deterministic if one bigram is
+        # ever a prefix of another.
+        self.direct_bigram_tokens.sort(key=len, reverse=True)
+
+    def _match_direct_bigram(self, normalized: str, index: int) -> Optional[str]:
+        """Return the direct bigram token starting at index, if one exists."""
+        if index > 0 and normalized[index - 1] != self.space_token:
+            return None
+
+        for token in self.direct_bigram_tokens:
+            end = index + len(token)
+            if (
+                normalized.startswith(token, index)
+                and (end == len(normalized) or normalized[end] == self.space_token)
+            ):
+                return token
+        return None
 
     def _add_token(self, token: str) -> None:
         """Add one token to the vocabulary if it is not present yet."""
@@ -366,10 +438,11 @@ class BPETokenizer(BaseTokenizer):
             return
 
         # WHAT: Add the most frequent adjacent-word surface as a final token.
-        # WHY: This token is still made from the same character alphabet and the
-        # provided training data. It exists only as a compliance fallback; normal
-        # BPE training on bigram entries should usually create one earlier. We
-        # also remember it so encode() can emit it if a stricter test checks
-        # actual encoded output rather than vocabulary membership only.
-        self._add_token(self.best_word_bigram)
-        self.forced_bigram_token = self.best_word_bigram
+        # WHY: This token is still selected from the provided training data. It
+        # exists only as a compliance fallback; normal direct-bigram selection
+        # should usually add several safer examples earlier.
+        if len(self.token_to_id) < self.vocab_size:
+            self._add_token(self.best_word_bigram)
+            self.direct_bigram_tokens.append(self.best_word_bigram)
+            self.direct_bigram_tokens.sort(key=len, reverse=True)
+            self.forced_bigram_token = self.best_word_bigram
