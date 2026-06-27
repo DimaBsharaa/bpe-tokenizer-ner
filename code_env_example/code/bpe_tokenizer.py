@@ -58,6 +58,24 @@ class BPETokenizer(BaseTokenizer):
         self.best_word_bigram: Optional[str] = None
         self.forced_bigram_token: Optional[str] = None
 
+    def __setstate__(self, state: Dict) -> None:
+        """Restore old pickles safely after code improvements.
+
+        WHAT: pickle loads saved objects by restoring their attribute dict. If
+        a tokenizer was trained before a new attribute existed, that attribute
+        will be missing after load.
+        WHY: This lets already-trained tokenizers keep working after harmless
+        compatibility changes, so we do not need to retrain just because we
+        added the `token_space` alias or the forced-bigram helper.
+        """
+        self.__dict__.update(state)
+        if not hasattr(self, "space_token") or self.space_token is None:
+            self.space_token = "\u2581"
+        if not hasattr(self, "token_space"):
+            self.token_space = self.space_token
+        if not hasattr(self, "forced_bigram_token"):
+            self.forced_bigram_token = None
+
     def train(self, texts: List[str]) -> None:
         """Train the BPE tokenizer on a list of texts."""
         word_counts, word_bigram_counts = self._collect_training_counts(texts)
