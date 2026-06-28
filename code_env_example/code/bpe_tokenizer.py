@@ -128,7 +128,7 @@ class BPETokenizer(BaseTokenizer):
         for surface, count in word_counts.most_common(self.max_word_entries):
             normalized = self._normalize_surface(surface)
             if normalized:
-                training_sequences[tuple(normalized)] = count
+                training_sequences[tuple(normalized)] = self._entity_biased_weight(surface, count)
 
         # WHAT: Also learn tokens for words preceded by a space marker, e.g.
         # "\u2581the" or "\u2581London".
@@ -139,7 +139,9 @@ class BPETokenizer(BaseTokenizer):
         for surface, count in word_counts.most_common(self.max_leading_space_entries):
             normalized = self._normalize_surface(surface)
             if normalized:
-                training_sequences[(self.space_token, *tuple(normalized))] = count
+                training_sequences[(self.space_token, *tuple(normalized))] = (
+                    self._entity_biased_weight(surface, count)
+                )
 
         self._add_initial_character_vocabulary(training_sequences)
         self._add_direct_bigram_tokens(direct_bigrams)
@@ -265,6 +267,44 @@ class BPETokenizer(BaseTokenizer):
     def _normalize_surface(self, surface: str) -> str:
         """Convert regular whitespace to the tokenizer's visible-space marker."""
         return "".join(self.space_token if char.isspace() else char for char in surface)
+
+    def _entity_biased_weight(self, surface: str, count: int) -> int:
+        """Boost the single-word BPE training weight for likely-entity words.
+
+        WHAT: A multiplier on `count`, used only for the per-word/leading-space
+        training_sequences that drive the iterative single-word merge loop. It
+        never touches `word_counts`/`word_bigram_counts` themselves, so it has
+        no effect on direct-bigram selection (which already has its own
+        capitalization-aware scoring in _score_direct_bigram) or on
+        best_word_bigram.
+        WHY: train_ner_model.py labels every word by its *first* BPE subtoken
+        only (see NERDataset._create_token_labels). Plain frequency-ranked BPE
+        tends to leave rarer proper nouns -- exactly the words NER most needs
+        to recognize -- fragmented into many character-level pieces, because
+        common function words simply outrank them on raw frequency. Nudging
+        capitalized/likely-entity surface forms to compete earlier in the
+        merge-frequency ranking helps them collapse into fewer, larger tokens
+        without changing the merge algorithm itself or any public interface.
+        The boost is modest and bounded so common low-information words are
+        unaffected and overall compression/efficiency does not regress.
+        """
+        if not surface or not any(char.isalpha() for char in surface):
+            return count
+        if surface.startswith(("http", "@", "#")):
+            return count
+
+        weight = 1.0
+        if surface.isupper() and len(surface) > 1:
+            # WHAT: ALL-CAPS, e.g. "NASA", "ESB".
+            weight *= 2.0
+        elif surface[:1].isupper():
+            # WHAT: Capitalized, e.g. "London", "Obama".
+            weight *= 1.5
+        if any(char.isdigit() for char in surface):
+            # WHAT: Mixed alphanumeric, e.g. model numbers, dates, "iPhone12".
+            weight *= 1.2
+
+        return max(count, round(count * weight))
 
     def _add_initial_character_vocabulary(
         self, training_sequences: Dict[Tuple[str, ...], int]
