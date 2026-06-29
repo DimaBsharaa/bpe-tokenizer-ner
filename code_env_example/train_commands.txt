@@ -1,14 +1,18 @@
-uv run python code/train_tokenizer.py --domain_file ../data/domain_1_train.txt --output_dir tokenizers_local/domain_1_final --vocab_size 4000
-uv run python code/train_tokenizer.py --domain_file ../data/domain_2_train.txt --output_dir tokenizers_local/domain_2_final --vocab_size 5000
-uv run python code/train_tokenizer.py --domain_file local_runs/domain_1_2_train.txt --output_dir tokenizers_local/domain_3_final --vocab_size 5000
+uv run python generate_tokenizers.py --data_dir ../data --output_dir trained_tokenizers_vocab4000 --vocab_size 4000 --train_files_1 domain_1_train.txt --train_files_2 domain_2_train.txt --train_files_3 domain_1_train.txt domain_2_train.txt
+uv run python generate_tokenizers.py --data_dir ../data --output_dir trained_tokenizers --vocab_size 5000 --train_files_1 domain_1_train.txt --train_files_2 domain_2_train.txt --train_files_3 domain_1_train.txt domain_2_train.txt
+cp trained_tokenizers_vocab4000/tokenizer_1.pkl trained_tokenizers/tokenizer_1.pkl
 
-# Each command above writes "tokenizer.pkl" into its --output_dir; copy/rename
-# to the submission names expected by check_submission.py:
-#   tokenizers_local/domain_1_final/tokenizer.pkl -> trained_tokenizers/tokenizer_1.pkl
-#   tokenizers_local/domain_2_final/tokenizer.pkl -> trained_tokenizers/tokenizer_2.pkl
-#   tokenizers_local/domain_3_final/tokenizer.pkl -> trained_tokenizers/tokenizer_3.pkl
+# Two generate_tokenizers.py runs are needed because it applies one global
+# --vocab_size to all three tokenizers per invocation. The first run (vocab_size
+# 4000) is kept only for tokenizer_1.pkl; the second run (vocab_size 5000, the
+# default) supplies tokenizer_2.pkl and tokenizer_3.pkl unchanged, and its own
+# tokenizer_1.pkl is overwritten by the first run's. Each individual
+# tokenizer_N.pkl is therefore exactly reproducible from a single documented
+# generate_tokenizers.py invocation above.
 #
 # tokenizer_1 uses vocab_size=4000 (not 5000) based on a vocab-size sweep on
 # domain_1_dev.txt NER F1 (1000/2000/3000/3500/4000/4200/4500/5000/8000 tried);
 # 4000 gave the best dev F1 (0.4931 vs 0.4572 at 5000) with no loss in encoding
-# speed or tokens/char. tokenizer_2 and tokenizer_3 are unchanged at vocab_size=5000.
+# speed or tokens/char. The same vocab_size=4000 was also tried for tokenizer_3
+# and rejected (see report). tokenizer_2 and tokenizer_3 use the default
+# vocab_size=5000 and default --train_files.
