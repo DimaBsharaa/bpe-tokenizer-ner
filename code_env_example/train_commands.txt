@@ -1,7 +1,12 @@
-uv run python generate_tokenizers.py --data_dir ../data --output_dir trained_tokenizers_vocab4000 --vocab_size 4000 --train_files_1 domain_1_train.txt --train_files_2 domain_2_train.txt --train_files_3 domain_1_train.txt domain_2_train.txt
-uv run python generate_tokenizers.py --data_dir ../data --output_dir trained_tokenizers --vocab_size 5000 --train_files_1 domain_1_train.txt --train_files_2 domain_2_train.txt --train_files_3 domain_1_train.txt domain_2_train.txt
+uv run python generate_tokenizers.py --output_dir trained_tokenizers_vocab4000 --vocab_size 4000
+uv run python generate_tokenizers.py --output_dir trained_tokenizers --vocab_size 5000
 cp trained_tokenizers_vocab4000/tokenizer_1.pkl trained_tokenizers/tokenizer_1.pkl
 
+# Run both commands from the code_env_example/ directory, with data/ present
+# directly inside it (generate_tokenizers.py's own default --data_dir is
+# "data"; --train_files_1/2/3 also default to the standard domain_1_train.txt /
+# domain_2_train.txt / both, so no overrides are needed here).
+#
 # Two generate_tokenizers.py runs are needed because it applies one global
 # --vocab_size to all three tokenizers per invocation. The first run (vocab_size
 # 4000) is kept only for tokenizer_1.pkl; the second run (vocab_size 5000, the
