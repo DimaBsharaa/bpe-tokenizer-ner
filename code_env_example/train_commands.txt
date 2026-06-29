@@ -1,0 +1,14 @@
+uv run python code/train_tokenizer.py --domain_file ../data/domain_1_train.txt --output_dir tokenizers_local/domain_1_final --vocab_size 4000
+uv run python code/train_tokenizer.py --domain_file ../data/domain_2_train.txt --output_dir tokenizers_local/domain_2_final --vocab_size 5000
+uv run python code/train_tokenizer.py --domain_file local_runs/domain_1_2_train.txt --output_dir tokenizers_local/domain_3_final --vocab_size 5000
+
+# Each command above writes "tokenizer.pkl" into its --output_dir; copy/rename
+# to the submission names expected by check_submission.py:
+#   tokenizers_local/domain_1_final/tokenizer.pkl -> trained_tokenizers/tokenizer_1.pkl
+#   tokenizers_local/domain_2_final/tokenizer.pkl -> trained_tokenizers/tokenizer_2.pkl
+#   tokenizers_local/domain_3_final/tokenizer.pkl -> trained_tokenizers/tokenizer_3.pkl
+#
+# tokenizer_1 uses vocab_size=4000 (not 5000) based on a vocab-size sweep on
+# domain_1_dev.txt NER F1 (1000/2000/3000/3500/4000/4200/4500/5000/8000 tried);
+# 4000 gave the best dev F1 (0.4931 vs 0.4572 at 5000) with no loss in encoding
+# speed or tokens/char. tokenizer_2 and tokenizer_3 are unchanged at vocab_size=5000.

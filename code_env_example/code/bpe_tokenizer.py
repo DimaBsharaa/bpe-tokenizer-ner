@@ -26,8 +26,7 @@ class BPETokenizer(BaseTokenizer):
         super().__init__()
         self.vocab_size = vocab_size
 
-        # WHAT: Use the SentencePiece/GPT-style visible-space marker.
-        # WHY: The homework requires a `space_token`, and using a real marker
+        # The homework requires a `space_token`, and using a real marker
         # lets BPE learn tokens that cross a single word boundary, for example
         # "New\u2581York", while decode() can still reconstruct normal spaces.
         # The escape keeps this source file ASCII even though the runtime value
@@ -35,14 +34,12 @@ class BPETokenizer(BaseTokenizer):
         self.token_space = "\u2581"
         self.space_token = self.token_space
 
-        # WHAT: Merge rules are stored in training order and by rank.
-        # WHY: Standard BPE encoding repeatedly applies the earliest learned
+        # Standard BPE encoding repeatedly applies the earliest learned
         # applicable merge. Keeping ranks makes encode() deterministic.
         self.merges: List[Tuple[str, str]] = []
         self.merge_ranks: Dict[Tuple[str, str], int] = {}
 
-        # WHAT: Practical limits for the training vocabulary used to learn BPE.
-        # WHY: Domain 1 is very large and noisy. Learning from every unique
+        # Domain 1 is very large and noisy. Learning from every unique
         # handle/URL/typo would spend most time on one-off strings. BPE is a
         # frequency algorithm, so keeping frequent words preserves the useful
         # signal and keeps training tractable.
@@ -51,8 +48,7 @@ class BPETokenizer(BaseTokenizer):
         self.max_token_chars = 40
         self.min_pair_frequency = 2
 
-        # WHAT: Add only a small, clean set of whole adjacent-word tokens.
-        # WHY: The HW requires at least one bigram token, but the NER model uses
+        # The HW requires at least one bigram token, but the NER model uses
         # first-subtoken word labels. Too many fragmentary cross-word BPE merges
         # can blur word boundaries, especially in noisy Twitter text. Keeping
         # bigrams whole and rare makes the requirement explicit without letting
@@ -61,8 +57,7 @@ class BPETokenizer(BaseTokenizer):
         self.min_direct_bigram_frequency = 10
         self.direct_bigram_min_score = 8.0
 
-        # WHAT: Remember the most common adjacent-word surface seen in training.
-        # WHY: The assignment has a hard requirement that each tokenizer contain
+        # The assignment has a hard requirement that each tokenizer contain
         # at least one token spanning two adjacent words. Direct bigram selection
         # should handle this normally; this field supports a final safety check.
         self.best_word_bigram: Optional[str] = None
@@ -70,10 +65,7 @@ class BPETokenizer(BaseTokenizer):
         self.direct_bigram_tokens: List[str] = []
         self.direct_bigram_by_first: Dict[str, List[str]] = {}
 
-        # WHAT: Cache of merge results for one word (optionally with one
-        # leading space marker), keyed by that substring, holding spans
-        # relative to the group's own start.
-        # WHY: encode() speed. See _merge_group for the correctness argument:
+        # encode() speed. See _merge_group for the correctness argument:
         # every learned merge pair comes from a training sequence that is
         # exactly one word or one (leading space + word), so the merge loop
         # never needs to look past a single such group. Caching it means a
@@ -83,10 +75,7 @@ class BPETokenizer(BaseTokenizer):
     def __setstate__(self, state: Dict) -> None:
         """Restore old pickles safely after code improvements.
 
-        WHAT: pickle loads saved objects by restoring their attribute dict. If
-        a tokenizer was trained before a new attribute existed, that attribute
-        will be missing after load.
-        WHY: This lets already-trained tokenizers keep working after harmless
+        This lets already-trained tokenizers keep working after harmless
         compatibility changes, so we do not need to retrain just because we
         added the `token_space` alias or the forced-bigram helper.
         """
@@ -106,8 +95,7 @@ class BPETokenizer(BaseTokenizer):
 
     def train(self, texts: List[str]) -> None:
         """Train the BPE tokenizer on a list of texts."""
-        # WHAT: Drop any cached encode() results from a previous training run.
-        # WHY: _merge_group's cache is keyed only by surface text, not by which
+        # _merge_group's cache is keyed only by surface text, not by which
         # merge_ranks produced it. If train() were ever called again on the
         # same instance, stale entries from the old merge table would be
         # returned for words seen during this new merge_ranks. Course scripts
@@ -119,8 +107,7 @@ class BPETokenizer(BaseTokenizer):
         self.best_word_bigram = self._best_bigram_surface(word_bigram_counts)
         direct_bigrams = self._select_direct_bigrams(word_bigram_counts)
 
-        # WHAT: Build the BPE training set as weighted character sequences.
-        # WHY: This is the classic efficient BPE trick: train on a vocabulary of
+        # This is the classic efficient BPE trick: train on a vocabulary of
         # unique strings with frequencies instead of rewriting the whole corpus
         # every iteration. We train the merge table on words only so subword
         # pieces stay aligned with words for the NER first-subtoken labels.
@@ -128,45 +115,26 @@ class BPETokenizer(BaseTokenizer):
         for surface, count in word_counts.most_common(self.max_word_entries):
             normalized = self._normalize_surface(surface)
             if normalized:
-                training_sequences[tuple(normalized)] = self._entity_biased_weight(surface, count)
+                training_sequences[tuple(normalized)] = count
 
-        # WHAT: Also learn tokens for words preceded by a space marker, e.g.
-        # "\u2581the" or "\u2581London".
-        # WHY: The previous experiment kept BPE purely word-internal and became
+        # The previous experiment kept BPE purely word-internal and became
         # inefficient because every word boundary stayed as its own token. A
         # leading-space word piece is safe: it does not span two words, but it
         # recovers the compression pattern used by common subword tokenizers.
         for surface, count in word_counts.most_common(self.max_leading_space_entries):
             normalized = self._normalize_surface(surface)
             if normalized:
-                training_sequences[(self.space_token, *tuple(normalized))] = (
-                    self._entity_biased_weight(surface, count)
-                )
+                training_sequences[(self.space_token, *tuple(normalized))] = count
 
         self._add_initial_character_vocabulary(training_sequences)
         self._add_direct_bigram_tokens(direct_bigrams)
 
-        # WHAT: Repeatedly merge the most frequent adjacent token pair.
-        # WHY: This is the BPE algorithm from the lecture/HW: start at
+        # This is the BPE algorithm from the lecture/HW: start at
         # character-level tokens, count frequent adjacent pairs, create a new
         # token for the best pair, and rewrite the training sequences.
-        while len(self.token_to_id) < self.vocab_size:
-            pair_counts = self._count_pairs(training_sequences)
-            if not pair_counts:
-                break
+        self._run_bpe_merges(training_sequences)
 
-            best_pair, best_count = self._select_best_pair(pair_counts)
-            if best_count < self.min_pair_frequency:
-                break
-
-            merged_token = "".join(best_pair)
-            self._add_token(merged_token)
-            self.merge_ranks[best_pair] = len(self.merges)
-            self.merges.append(best_pair)
-            training_sequences = self._merge_training_pair(training_sequences, best_pair)
-
-        # WHAT: Ensure the hard assignment constraint is visible in the vocab.
-        # WHY: The provided checker disqualifies tokenizers with no token whose
+        # The provided checker disqualifies tokenizers with no token whose
         # decoded surface contains an internal space. In normal runs this should
         # already happen because we train on frequent adjacent-word strings; the
         # fallback keeps the tokenizer compliant even on unusual small samples.
@@ -180,9 +148,7 @@ class BPETokenizer(BaseTokenizer):
 
     def decode(self, token_ids: List[int]) -> str:
         """Convert a list of token IDs back into a text string."""
-        # WHAT: Concatenate token surfaces and turn the visible space marker
-        # back into a normal space.
-        # WHY: BPE tokens are pieces of the original string; decode should be
+        # BPE tokens are pieces of the original string; decode should be
         # simple and reversible for all tokens that came from the vocabulary.
         pieces = []
         for token_id in token_ids:
@@ -195,9 +161,7 @@ class BPETokenizer(BaseTokenizer):
     def sanity_check(self, sample_text: str = "New York is here") -> Dict:
         """Return simple invariants that should hold after training.
 
-        WHAT: This is a lightweight debugging helper, not part of the provided
-        course interface.
-        WHY: The HW has several hard tokenizer requirements. Keeping the checks
+        The HW has several hard tokenizer requirements. Keeping the checks
         close to the tokenizer makes it easy to verify a trained pickle before
         spending GPU time on NER.
         """
@@ -231,8 +195,7 @@ class BPETokenizer(BaseTokenizer):
     def encode_with_offsets(self, text: str) -> Tuple[List[int], List[Tuple[int, int]]]:
         """Encode text and return character spans for each token.
 
-        WHAT: This optional method is read by train_ner_model.py.
-        WHY: Without it, the NER pipeline repeatedly decodes every token prefix
+        Without it, the NER pipeline repeatedly decodes every token prefix
         to guess spans, which is slower. Offsets also make first-subtoken labels
         line up more cleanly with the original words.
         """
@@ -250,8 +213,7 @@ class BPETokenizer(BaseTokenizer):
         word_bigram_counts = Counter()
 
         for text in texts:
-            # WHAT: Remove only line endings introduced by the corpus file.
-            # WHY: Each input line is one sentence. Keeping the file newline as
+            # Each input line is one sentence. Keeping the file newline as
             # a learnable character would waste vocabulary on an artifact that
             # the NER sentences do not contain.
             words = text.rstrip("\r\n").split()
@@ -268,44 +230,6 @@ class BPETokenizer(BaseTokenizer):
         """Convert regular whitespace to the tokenizer's visible-space marker."""
         return "".join(self.space_token if char.isspace() else char for char in surface)
 
-    def _entity_biased_weight(self, surface: str, count: int) -> int:
-        """Boost the single-word BPE training weight for likely-entity words.
-
-        WHAT: A multiplier on `count`, used only for the per-word/leading-space
-        training_sequences that drive the iterative single-word merge loop. It
-        never touches `word_counts`/`word_bigram_counts` themselves, so it has
-        no effect on direct-bigram selection (which already has its own
-        capitalization-aware scoring in _score_direct_bigram) or on
-        best_word_bigram.
-        WHY: train_ner_model.py labels every word by its *first* BPE subtoken
-        only (see NERDataset._create_token_labels). Plain frequency-ranked BPE
-        tends to leave rarer proper nouns -- exactly the words NER most needs
-        to recognize -- fragmented into many character-level pieces, because
-        common function words simply outrank them on raw frequency. Nudging
-        capitalized/likely-entity surface forms to compete earlier in the
-        merge-frequency ranking helps them collapse into fewer, larger tokens
-        without changing the merge algorithm itself or any public interface.
-        The boost is modest and bounded so common low-information words are
-        unaffected and overall compression/efficiency does not regress.
-        """
-        if not surface or not any(char.isalpha() for char in surface):
-            return count
-        if surface.startswith(("http", "@", "#")):
-            return count
-
-        weight = 1.0
-        if surface.isupper() and len(surface) > 1:
-            # WHAT: ALL-CAPS, e.g. "NASA", "ESB".
-            weight *= 2.0
-        elif surface[:1].isupper():
-            # WHAT: Capitalized, e.g. "London", "Obama".
-            weight *= 1.5
-        if any(char.isdigit() for char in surface):
-            # WHAT: Mixed alphanumeric, e.g. model numbers, dates, "iPhone12".
-            weight *= 1.2
-
-        return max(count, round(count * weight))
-
     def _add_initial_character_vocabulary(
         self, training_sequences: Dict[Tuple[str, ...], int]
     ) -> None:
@@ -314,8 +238,7 @@ class BPETokenizer(BaseTokenizer):
         for sequence in training_sequences:
             chars.update(sequence)
 
-        # WHAT: Add common ASCII characters even if a domain sample misses one.
-        # WHY: The lecture motivation is avoiding unnecessary [UNK] tokens. This
+        # The lecture motivation is avoiding unnecessary [UNK] tokens. This
         # does not learn from external text; it only gives the tokenizer a basic
         # character fallback for ordinary English punctuation, digits, and case.
         chars.update(chr(code) for code in range(32, 127))
@@ -323,28 +246,6 @@ class BPETokenizer(BaseTokenizer):
 
         for char in sorted(chars):
             self._add_token(char)
-
-    def _count_pairs(
-        self, sequences: Dict[Tuple[str, ...], int]
-    ) -> Counter:
-        """Count adjacent token pairs, weighted by training frequency."""
-        pair_counts = Counter()
-        for sequence, count in sequences.items():
-            for left, right in zip(sequence, sequence[1:]):
-                merged = left + right
-
-                # WHAT: Allow normal word-internal merges plus leading-space
-                # word pieces like "\u2581the"; block internal cross-word
-                # fragments like "I\u2581w".
-                # WHY: Leading-space pieces improve token efficiency without
-                # labeling ambiguity, while internal cross-word fragments blur
-                # the first-subtoken labels used by the NER pipeline.
-                if not self._is_safe_merge_token(merged):
-                    continue
-                if len(merged) > self.max_token_chars:
-                    continue
-                pair_counts[(left, right)] += count
-        return pair_counts
 
     def _select_best_pair(self, pair_counts: Counter) -> Tuple[Tuple[str, str], int]:
         """Pick the most frequent pair with deterministic tie-breaking."""
@@ -354,32 +255,92 @@ class BPETokenizer(BaseTokenizer):
         )
         return best_pair, best_count
 
-    def _merge_training_pair(
-        self,
-        sequences: Dict[Tuple[str, ...], int],
-        pair: Tuple[str, str],
-    ) -> Dict[Tuple[str, ...], int]:
-        """Replace all non-overlapping instances of one pair in training data."""
-        merged_sequences = Counter()
-        merged_token = pair[0] + pair[1]
+    def _run_bpe_merges(self, training_sequences: Dict[Tuple[str, ...], int]) -> None:
+        """Learn merges in vocab_size order, keeping pair counts up to date.
 
-        for sequence, count in sequences.items():
-            new_sequence = []
-            index = 0
-            while index < len(sequence):
-                if (
-                    index + 1 < len(sequence)
-                    and sequence[index] == pair[0]
-                    and sequence[index + 1] == pair[1]
-                ):
-                    new_sequence.append(merged_token)
-                    index += 2
+        An earlier version called a full _count_pairs rescan of every
+        training sequence, then a full _merge_training_pair rewrite of every
+        training sequence, once per merge. With thousands of merges and tens
+        of thousands of unique training sequences, that rescan-everything
+        approach was the dominant cost of train() and made full-scale
+        training far slower than it needs to be. This produces the exact
+        same merge order and final vocabulary as that version -- the
+        selection rule (_select_best_pair) and the safety/length filters
+        (_is_safe_merge_token, max_token_chars) are unchanged; only how the
+        running counts are kept up to date is different.
+        """
+        sequences: Dict[Tuple[str, ...], int] = dict(training_sequences)
+        pair_counts: Counter = Counter()
+        pair_sequences: Dict[Tuple[str, str], set] = {}
+
+        def adjust(sequence: Tuple[str, ...], weight: int, sign: int) -> None:
+            for left, right in zip(sequence, sequence[1:]):
+                merged = left + right
+                if not self._is_safe_merge_token(merged):
+                    continue
+                if len(merged) > self.max_token_chars:
+                    continue
+                pair = (left, right)
+                pair_counts[pair] += sign * weight
+                if pair_counts[pair] <= 0:
+                    del pair_counts[pair]
+                bucket = pair_sequences.setdefault(pair, set())
+                if sign > 0:
+                    bucket.add(sequence)
                 else:
-                    new_sequence.append(sequence[index])
-                    index += 1
-            merged_sequences[tuple(new_sequence)] += count
+                    bucket.discard(sequence)
+                    if not bucket:
+                        del pair_sequences[pair]
 
-        return dict(merged_sequences)
+        for sequence, weight in sequences.items():
+            adjust(sequence, weight, 1)
+
+        while len(self.token_to_id) < self.vocab_size:
+            if not pair_counts:
+                break
+
+            best_pair, best_count = self._select_best_pair(pair_counts)
+            if best_count < self.min_pair_frequency:
+                break
+
+            merged_token = "".join(best_pair)
+            self._add_token(merged_token)
+            self.merge_ranks[best_pair] = len(self.merges)
+            self.merges.append(best_pair)
+
+            # Re-deriving counts for the whole corpus on every merge is
+            # exactly the cost this method avoids.
+            affected = list(pair_sequences.get(best_pair, ()))
+            regrouped: Dict[Tuple[str, ...], int] = {}
+            for sequence in affected:
+                weight = sequences.pop(sequence)
+                adjust(sequence, weight, -1)
+                new_sequence = self._apply_merge(sequence, best_pair, merged_token)
+                regrouped[new_sequence] = regrouped.get(new_sequence, 0) + weight
+
+            for new_sequence, weight in regrouped.items():
+                sequences[new_sequence] = weight
+                adjust(new_sequence, weight, 1)
+
+    @staticmethod
+    def _apply_merge(
+        sequence: Tuple[str, ...], pair: Tuple[str, str], merged_token: str
+    ) -> Tuple[str, ...]:
+        """Replace all non-overlapping instances of one pair in one sequence."""
+        new_sequence = []
+        index = 0
+        while index < len(sequence):
+            if (
+                index + 1 < len(sequence)
+                and sequence[index] == pair[0]
+                and sequence[index + 1] == pair[1]
+            ):
+                new_sequence.append(merged_token)
+                index += 2
+            else:
+                new_sequence.append(sequence[index])
+                index += 1
+        return tuple(new_sequence)
 
     def _bpe_tokens(self, text: str) -> List[str]:
         """Apply learned BPE merges to text and return token strings."""
@@ -388,10 +349,7 @@ class BPETokenizer(BaseTokenizer):
     def _bpe_token_spans(self, text: str) -> List[Tuple[str, int, int]]:
         """Apply BPE while carrying original character offsets.
 
-        WHAT: Split the character-level spans into small, independent
-        groups and merge each group on its own (with caching), instead of
-        repeatedly re-scanning the whole text for the single best merge.
-        WHY (correctness): a learned merge pair always comes from a
+        Correctness: a learned merge pair always comes from a
         training sequence in train() that is exactly one word's characters,
         or one leading space marker plus one word's characters (see
         _collect_training_counts / _add_initial_character_vocabulary).
@@ -405,7 +363,7 @@ class BPETokenizer(BaseTokenizer):
         -- splitting into groups changes nothing about the result, it only
         bounds how much text one merge loop has to re-scan, and lets
         repeated words reuse a cached result instead of recomputing it.
-        WHY (speed): this is the dominant cost for encode() on longer or
+        Speed: this is the dominant cost for encode() on longer or
         noisier text, since the original loop's cost grows with the square
         of the number of remaining spans in the *whole* line. Each group
         here is just one word long, and common words are cached.
@@ -419,9 +377,7 @@ class BPETokenizer(BaseTokenizer):
             token, start, end = initial_spans[index]
 
             if end - start > 1:
-                # WHAT: An already-finished multi-character span, i.e. a
-                # direct bigram token from _initial_token_spans.
-                # WHY: Direct bigram tokens never appear as either side of a
+                # Direct bigram tokens never appear as either side of a
                 # learned merge pair, so they are emitted as-is.
                 output.append((token, start, end))
                 index += 1
@@ -429,7 +385,7 @@ class BPETokenizer(BaseTokenizer):
 
             group_start = index
             if token == self.space_token:
-                # WHAT: A lone space marker can only ever fuse with the word
+                # A lone space marker can only ever fuse with the word
                 # run immediately after it (never with another space, and
                 # never with an already-finished multi-character span).
                 next_is_mergeable_word = (
@@ -443,7 +399,7 @@ class BPETokenizer(BaseTokenizer):
                     continue
                 index += 1  # fold the space into the group that follows
 
-            # WHAT: Consume the run of plain single-character, non-space
+            # Consume the run of plain single-character, non-space
             # spans that makes up the rest of this group (one word).
             while (
                 index < total
@@ -461,11 +417,7 @@ class BPETokenizer(BaseTokenizer):
     ) -> List[Tuple[str, int, int]]:
         """Apply learned merges to one self-contained group (see above).
 
-        WHAT: `group` is a list of single-character spans -- one word,
-        optionally with a single leading space marker -- that can only ever
-        merge among themselves. The merge loop itself is unchanged from the
-        original whole-text version, just scoped to this short group.
-        WHY: Caches by the group's character string, since the same word or
+        Caches by the group's character string, since the same word or
         leading-space word recurs constantly across real text.
         """
         key = "".join(piece for piece, _, _ in group)
@@ -514,10 +466,7 @@ class BPETokenizer(BaseTokenizer):
     def _initial_token_spans(self, text: str) -> List[Tuple[str, int, int]]:
         """Create character spans, with an optional direct bigram fallback.
 
-        WHAT: If `_ensure_bigram_token()` had to add a bigram manually, encode
-        can emit that token directly when the exact adjacent-word surface is
-        found in text.
-        WHY: The checker definitely looks for a bigram in the vocabulary, but
+        The checker definitely looks for a bigram in the vocabulary, but
         this also handles a stricter interpretation where encode() should be
         able to produce at least one adjacent-word token.
         """
@@ -543,9 +492,7 @@ class BPETokenizer(BaseTokenizer):
     def _select_direct_bigrams(self, word_bigram_counts: Counter) -> List[str]:
         """Choose whole-word bigram tokens that are useful for NER.
 
-        WHAT: Rank candidate bigrams by a small NER-oriented score instead of
-        raw frequency alone.
-        WHY: Raw frequency tends to pick boring phrases such as "of\u2581the" or
+        Raw frequency tends to pick boring phrases such as "of\u2581the" or
         noisy social phrases such as "lol\u2581I". For NER we would rather spend
         the required bigram budget on stable proper-name-looking pairs such as
         "New\u2581York" or "European\u2581Commission".
@@ -598,8 +545,7 @@ class BPETokenizer(BaseTokenizer):
         right_lower = right.lower()
         score = min(count, 100) ** 0.5
 
-        # WHAT: Prefer proper-name-looking pairs.
-        # WHY: In NER, multi-word entities are often capitalized names,
+        # In NER, multi-word entities are often capitalized names,
         # organizations, locations, or titles.
         if left[:1].isupper() and right[:1].isupper():
             score += 12.0
@@ -611,8 +557,7 @@ class BPETokenizer(BaseTokenizer):
         if right.isupper() and len(right) > 1:
             score += 3.0
 
-        # WHAT: Penalize high-frequency function-word phrases.
-        # WHY: They help compression, but they are rarely entity signals and can
+        # They help compression, but they are rarely entity signals and can
         # consume the assignment's small direct-bigram budget.
         function_words = {
             "a", "an", "and", "are", "as", "at", "be", "been", "but",
@@ -660,8 +605,7 @@ class BPETokenizer(BaseTokenizer):
         if index > 0 and normalized[index - 1] != self.space_token:
             return None
 
-        # WHAT: Only inspect direct bigrams that can start with this character.
-        # WHY: Encoding visits many character positions. A dict index avoids
+        # Encoding visits many character positions. A dict index avoids
         # scanning every selected bigram at positions where most cannot match,
         # while preserving the same longest-first order inside each bucket.
         for token in self.direct_bigram_by_first.get(normalized[index], []):
@@ -721,8 +665,7 @@ class BPETokenizer(BaseTokenizer):
         if self._has_bigram_token() or not self.best_word_bigram:
             return
 
-        # WHAT: Add the most frequent adjacent-word surface as a final token.
-        # WHY: This token is still selected from the provided training data. It
+        # This token is still selected from the provided training data. It
         # exists only as a compliance fallback; normal direct-bigram selection
         # should usually add several safer examples earlier.
         if len(self.token_to_id) < self.vocab_size:
